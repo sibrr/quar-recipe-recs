@@ -1,0 +1,173 @@
+---
+title: "Quarantine Recipe Recommender"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+The link to my GitHub repository, which contains the .rmd file for this report and a zip file containing the two datasets I used, is https://github.com/sibrr/quar-recipe-recs.
+Due to the nature of this project, I felt it made the most sense to submit a report that includes an example of the recommendation system at work. The .rmd file can be used to recreate the results but requires a working connection between R and a SQL server.
+The objective of this project is to create a system that recommends recipes which use as many of a given list of ingredients and as few additional ingredients as possible.
+
+## Preliminary Steps
+This chunk includes the packages, libraries, and datasets needed for the rest of the script. RMariaDB is used to write SQL queries in R. The remaining packages are used as part of the text mining process. This chunk also establishes a connection between R and a SQL server - the username, password and host options will need to be changed before running.
+
+```{r}
+#install.packages("RMariaDB")
+#install.packages("slam")
+#install.packages("SnowballC")
+#install.packages("tm")
+library(RMariaDB)
+library(tm)
+library(SnowballC)
+library(slam)
+
+recipe <- read.csv(file = 'C:/Users/Simon/Desktop/SCHOOL/Capstone/clean_recipes.csv', header=T, stringsAsFactors = F)
+review <- read.csv(file = 'C:/Users/Simon/Desktop/SCHOOL/Capstone/clean_reviews.csv', header=T, stringsAsFactors = F)
+
+testDB <- dbConnect(RMariaDB::MariaDB(), user='simon', password='prism-sb', dbname='misc', host='192.168.70.7')
+```
+
+## Creating SQL Tables
+This chunk uses the RMariaDB package to write queries that create and populate three SQL tables. The "recipe" table stores recipes, including their names, ingredients, directions, and more. The "review" table stores over 1.5 million total user reviews of these recipes. The "avgrating" table generates the average using rating for each recipe.
+
+NOTE: Due to the large size of the datasets, it is much faster to import the data directly using a SQL workbench. I have included the code here as comments for completeness.
+
+```{r}
+#drop_recipe_table <- ("DROP TABLE IF EXISTS recipe")
+#rs = dbSendQuery(testDB, drop_recipe_table)
+#recipe_table <- ("CREATE TABLE recipe (Name varchar(255), Count int(11), Photo varchar(255), Author varchar(255), PrepTime varchar(255), CookTime varchar(255), #TotalTime varchar(255), Ingredients text, Directions text, ID int(11))")
+#rs = dbSendQuery(testDB, recipe_table)
+#dbWriteTable(testDB, value=recipe, row.names=FALSE, name="recipe",append=TRUE)
+
+#drop_review_table <- ("DROP TABLE IF EXISTS review")
+#rs = dbSendQuery(testDB, drop_review_table)
+#review_table <- ("CREATE TABLE review (RecipeID int(11), ProfileID int(11), Rate tinyint(1))")
+#rs = dbSendQuery(testDB, review_table)
+#dbWriteTable(testDB, value=review, row.names=FALSE, name="review",append=TRUE)
+
+#drop_avgrating_table <- ("DROP TABLE IF EXISTS avgrating")
+#rs = dbSendQuery(testDB, drop_avgrating_table)
+#avgrating_table <- ("CREATE TABLE avgrating AS SELECT RecipeID, AVG(Rate) AS AvgRate FROM review GROUP BY RecipeID")
+#rs = dbSendQuery(testDB, avgrating_table)
+
+#drop_medianrating_table <- ("DROP TABLE IF EXISTS medianrating")
+#rs = dbSendQuery(testDB, drop_medianrating_table)
+#medianrating_table <- ("CREATE TABLE medianrating AS SELECT RecipeID, AVG(1.0*Rate) AS MedianRate FROM (SELECT RecipeID, Rate, ROW_NUMBER() #OVER (PARTITION BY RecipeID ORDER BY Rate) AS RowNum, COUNT(*) OVER (PARTITION BY RecipeID) AS C FROM misc.review) AS temptbl WHERE RowNum #IN ((C+1)/2, (C+2)/2) GROUP BY RecipeID")
+#rs = dbSendQuery(testDB, medianrating_table)
+```
+
+## Ingredient Input
+This variable allows the user to enter a list of ingredients, which will then be used to recommend recipes. Ingredients should be entered as a single, comma-separated list.
+
+```{r}
+my_ingredients <- "chicken, rice, broccoli, onions, garlic"
+```
+
+## Document Collection
+The "documents" in this case are the set of ingredients used in each recipe. These are collected from the SQL recipe table in one large list, and then separated into different documents using the split function. Each document is also given a name corresponding to its row in the SQL table, e.g. the recipe in the third row is named "doc3".
+
+```{r}
+alldocs <- ("SELECT ingredients FROM misc.recipe")
+rs = dbSendQuery(testDB, alldocs)
+alldocs <- dbFetch(rs)
+
+doc.list <- split(alldocs, seq(nrow(alldocs)))
+N.docs <- length(doc.list)
+names(doc.list) <- paste0("doc",c(1:N.docs))
+```
+
+## Text Mining
+This chunk creates a corpus out of the recipe document collection and the user's ingredient list. The corpus is then standardized by removing punctuation and via the Porter Stemmer algorithm.
+
+```{r}
+my.docs <- VectorSource(c(doc.list, my_ingredients))
+my.corpus <- Corpus(my.docs)
+my.corpus <- tm_map(my.corpus, removePunctuation)
+my.corpus <- tm_map(my.corpus, stemDocument)
+```
+
+## Term Document Matrix
+This chunk creates a matrix of each unique term in the corpus and its count in each document. Some ingredients appear multiple times in each document as a result of standardization.
+
+```{r}
+term.doc.matrix.stm <- TermDocumentMatrix(my.corpus)
+colnames(term.doc.matrix.stm) <- c(names(doc.list), my_ingredients)
+inspect(term.doc.matrix.stm[0:10, ])
+term.doc.matrix <- as.matrix(term.doc.matrix.stm)
+```
+
+## TF-IDF Weighting
+TF-IDF weights of (1+log2fik)*log2(N/nk) are next applied to each row of the term document matrix. These weightings are used to measure how "important" an ingredient is to each recipe, which will form the basis of the recommendation system.
+
+```{r}
+get.tf.idf.weights <- function(tf.vec) {n.docs <- length(tf.vec);
+doc.frequency <- length(tf.vec[tf.vec >0]);
+weights <- rep(0, length(tf.vec));
+weights[tf.vec>0] <- (1+log2(tf.vec[tf.vec>0]))*log2(n.docs/doc.frequency)
+#weights[tf.vec>0] <- (1+log2(tf.vec[tf.vec>0]))*log2((n.docs+1)/doc.frequency)
+#weights[tf.vec>0] <- (1+log2(tf.vec[tf.vec>0]))*log2((n.docs-doc.frequency)/doc.frequency)
+return(weights)}
+
+tfidf.matrix <- t(apply(term.doc.matrix,1,FUN=function(row) {get.tf.idf.weights(row)}))
+colnames(tfidf.matrix) <- colnames(term.doc.matrix)
+tfidf.matrix <- scale(tfidf.matrix, center=FALSE, scale=sqrt(colSums(tfidf.matrix^2)))
+```
+
+## Cosine Similarity Scores
+The query vector and corpus are split from each other, then matrix multiplication is used to calculate the cosine value between each recipe in the corpus and the user's ingredient list. Next, the recipes are ordered by their cosine similairty scores and listed alongside their ingredients in the results data frame.
+
+```{r}
+query.vector <- tfidf.matrix[, (N.docs + 1)]
+tfidf.matrix <- tfidf.matrix[, 1:N.docs]
+
+doc.scores <- t(query.vector) %*% tfidf.matrix
+
+results.df <- data.frame(doc = names(doc.list), score = t(doc.scores), text = unlist(doc.list))
+results.df <- results.df[order(results.df$score, decreasing = TRUE), ]
+head(results.df)
+```
+
+## Recipe Recommendations
+The contents of the results data frame are passed from R to SQL after creating a SQL table to house them. This step is necessary so that the final recommendations can be matched with other key information from the original recipes tables (e.g. total time, directions) as well as the average user rating for that recipe. This is done by using SQL's JOIN function on three tables and selecting columns from each to form a temporary new table. The contents of this temporary table (i.e. "recommendations") are then passed back to R. Finally, a text statement displays the name of the top recipe and direct's users to a table with the top five recipes.
+
+```{r}
+drop_results_table <- ("DROP TABLE IF EXISTS recommendations")
+rs = dbSendQuery(testDB, drop_results_table)
+results_table <- ("CREATE TABLE recommendations (doc VARCHAR(50), score FLOAT, text TEXT)")
+rs = dbSendQuery(testDB, results_table)
+dbWriteTable(testDB, value=results.df, row.names=FALSE, name="recommendations",append=TRUE)
+
+#recommendations <- ("SELECT rc.Name, rm.score, ar.AvgRate, rc.TotalTime, rc.Ingredients, rc.Directions
+#  FROM misc.recommendations rm
+#  JOIN misc.recipe rc
+#  ON rm.text = rc.Ingredients
+#  JOIN misc.avgrating ar
+#  ON rc.ID = ar.RecipeID
+#  GROUP BY ar.RecipeID
+#  ORDER BY rm.score DESC")
+#rs = dbSendQuery(testDB, recommendations)
+#recommendations <- dbFetch(rs)
+
+recommendations <- ("SELECT rc.Name, rm.score, ar.MedianRate, rc.TotalTime, rc.Ingredients, rc.Directions
+  FROM misc.recommendations rm
+  JOIN misc.recipe rc
+  ON rm.text = rc.Ingredients
+  JOIN misc.medianrating ar
+  ON rc.ID = ar.RecipeID
+  GROUP BY ar.RecipeID
+  ORDER BY rm.score DESC")
+rs = dbSendQuery(testDB, recommendations)
+recommendations <- dbFetch(rs)
+
+paste("Hi! You entered the following ingredients:", my_ingredients, ".", "The best match for these ingredients on Allrecipes.com is", recommendations[1,1], ".", "See below for details of the top five matching recipes. Happy cooking!")
+head(recommendations,5)
+```
+
+## Conclusions & Next Steps
+Overall, the recipe recommendations seem to meet the objective outlined in the Introduction. The system appears to perform best with dessert recipes, though the reason why is not immediately clear. One issue that needs to be dealt with is that the standardization process creates some recipes with duplicates in their ingredients lists which biases the TF-IDF weighting. In terms of next steps, I plan to test different SMART TF-IDF weightings as seen here https://en.wikipedia.org/wiki/SMART_Information_Retrieval_System to see how they affect which recipes are selected. I would also like to run a test using the median user rating rather than the mean, since so many of the ratings are 5 out of 5 (creating an upward bias).
